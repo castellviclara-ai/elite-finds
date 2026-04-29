@@ -32,6 +32,16 @@ _BASE = "https://api.uufinds.com"
 _ORIGIN = "https://www.uufinds.com"
 _SALT = "8c69d69dcb7e47b6914b075ef076f3c4"
 
+_BASE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Origin": _ORIGIN,
+    "Referer": f"{_ORIGIN}/",
+    "Accept": "application/json, text/plain, */*",
+}
+
 _GENERIC = {
     "shorts", "pants", "shirt", "tee", "hoodie", "jacket", "coat",
     "shoes", "sneakers", "boots", "sandals", "bag", "hat", "cap",
