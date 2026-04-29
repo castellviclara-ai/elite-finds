@@ -1,0 +1,7 @@
+services:
+  elite-finds-bot:
+    name: Elite Finds Bot
+    description: Discord bot - Elite Finds#3377
+    commands:
+      start: cd /workspaces/elite-finds && pip install -q -r requirements.txt && python3 -m bot.main
+      ready: pgrep -f "bot.main" > /dev/null
