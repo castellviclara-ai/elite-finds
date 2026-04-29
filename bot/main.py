@@ -62,14 +62,6 @@ class EliteFindsBot(commands.Bot):
         self.uufinds = UUFindsClient()
 
     async def setup_hook(self) -> None:
-        # Pre-warm uufinds token
-        log.info("Pre-warming uufinds token...")
-        try:
-            await self.uufinds.ensure_token()
-            log.info("uufinds token ready")
-        except Exception as e:
-            log.warning("uufinds pre-warm failed (will retry on first /find): %s", e)
-
         # Load cogs
         for cog in COGS:
             await self.load_extension(cog)
@@ -78,6 +70,17 @@ class EliteFindsBot(commands.Bot):
         # Sync slash commands globally
         synced = await self.tree.sync()
         log.info("Synced %d slash commands", len(synced))
+
+        # Pre-warm uufinds token in background — don't block Discord connection
+        asyncio.create_task(self._prewarm_uufinds())
+
+    async def _prewarm_uufinds(self) -> None:
+        log.info("Pre-warming uufinds token...")
+        try:
+            await self.uufinds.ensure_token()
+            log.info("uufinds token ready")
+        except Exception as e:
+            log.warning("uufinds pre-warm failed (will retry on first /find): %s", e)
 
     async def on_ready(self) -> None:
         log.info("Logged in as %s (ID: %s)", self.user, self.user.id)
