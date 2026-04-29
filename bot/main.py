@@ -29,6 +29,7 @@ log = logging.getLogger(__name__)
 COGS = [
     "bot.cogs.tickets",
     "bot.cogs.link_converter",
+    "bot.cogs.market_search",
 ]
 
 

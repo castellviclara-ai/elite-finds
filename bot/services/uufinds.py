@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 
 import aiohttp
 import ddddocr
+from fuzzywuzzy import fuzz
 
 log = logging.getLogger(__name__)
 
@@ -31,15 +32,13 @@ _BASE = "https://api.uufinds.com"
 _ORIGIN = "https://www.uufinds.com"
 _SALT = "8c69d69dcb7e47b6914b075ef076f3c4"
 
-_BASE_HEADERS = {
-    "Origin": _ORIGIN,
-    "Referer": _ORIGIN + "/",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "X-Client-Type": "web",
+_GENERIC = {
+    "shorts", "pants", "shirt", "tee", "hoodie", "jacket", "coat",
+    "shoes", "sneakers", "boots", "sandals", "bag", "hat", "cap",
+    "socks", "belt", "wallet", "watch", "glasses", "sunglasses",
+    "dress", "skirt", "jeans", "joggers", "sweatpants", "tracksuit",
+    "low", "high", "mid", "men", "women", "unisex", "kids",
+    "white", "black", "red", "blue", "green", "grey", "gray",
 }
 
 
@@ -60,6 +59,7 @@ class Product:
     price_usd: float
     qc_image_count: int
     qc_images: list[str] = field(default_factory=list)
+    major_img: str = ""          # main product image URL
     tier: str = "mid"            # assigned after bucketing
 
     @property
@@ -191,6 +191,7 @@ class UUFindsClient:
                     price_usd=float(item.get("price", 0)),
                     qc_image_count=int(item.get("qcImgQuantity", 0)),
                     qc_images=item.get("qcImageList") or [],
+                    major_img=item.get("majorImg", ""),
                 )
                 products.append(p)
             except (KeyError, ValueError, TypeError) as e:
@@ -202,6 +203,7 @@ class UUFindsClient:
         """
         Try NEW first; fall back to RECOMMEND if 0 results.
         Auto-renew token on 401.
+        If still 0, try with non-generic tokens only.
         """
         for rank_type in ("NEW", "RECOMMEND"):
             try:
@@ -217,6 +219,24 @@ class UUFindsClient:
             if results:
                 return results
             log.debug("rankType=%s returned 0 results, trying fallback", rank_type)
+
+        # Fallback: search with non-generic tokens only
+        tokens = [t.lower() for t in keyword.split() if len(t) > 1]
+        non_generic = [t for t in tokens if t not in _GENERIC]
+        if non_generic and len(non_generic) < len(tokens):
+            fallback_query = " ".join(non_generic)
+            log.debug("Trying fallback query: %s", fallback_query)
+            for rank_type in ("NEW", "RECOMMEND"):
+                try:
+                    results = await self.search(fallback_query, page_size=page_size, rank_type=rank_type)
+                except RuntimeError as e:
+                    if "expired" in str(e):
+                        await self.invalidate_token()
+                        results = await self.search(fallback_query, page_size=page_size, rank_type=rank_type)
+                    else:
+                        raise
+                if results:
+                    return results
 
         return []
 
@@ -246,39 +266,16 @@ def filter_results(products: list[Product], query: str) -> list[Product]:
     Rules:
     1. Remove products with qc_image_count == 0
     2. If >40% CJK chars in subject, keep only if qc_image_count >= 50
-    3. Token matching — two modes:
-       a. Single token: must appear in subject
-       b. Multi-token: ALL tokens must appear in subject.
-          Exception: generic clothing words (shorts, pants, shirt, etc.)
-          are optional — but brand/model tokens are required.
-    4. If fewer than 3 pass, relax to "at least half tokens match"
+    3. Fuzzy matching: token_sort_ratio >80 for strict, >60 for relaxed
+    4. If fewer than 3 pass, relax threshold
     5. If still fewer than 3, return original list unfiltered
     """
-    # Words that are too generic to be required on their own
-    _GENERIC = {
-        "shorts", "pants", "shirt", "tee", "hoodie", "jacket", "coat",
-        "shoes", "sneakers", "boots", "sandals", "bag", "hat", "cap",
-        "socks", "belt", "wallet", "watch", "glasses", "sunglasses",
-        "dress", "skirt", "jeans", "joggers", "sweatpants", "tracksuit",
-        "low", "high", "mid", "men", "women", "unisex", "kids",
-        "white", "black", "red", "blue", "green", "grey", "gray",
-    }
 
-    all_tokens = [t.lower() for t in query.split() if len(t) > 1]
-    # Required = non-generic tokens (brand/model words)
-    required = [t for t in all_tokens if t not in _GENERIC]
-    # If everything is generic, require all tokens
-    if not required:
-        required = all_tokens
+    def _matches_strict(p: Product) -> bool:
+        return fuzz.token_sort_ratio(query, p.subject) > 80
 
-    def _matches_strict(subject_lower: str) -> bool:
-        return all(t in subject_lower for t in required)
-
-    def _matches_relaxed(subject_lower: str) -> bool:
-        if not all_tokens:
-            return True
-        matches = sum(1 for t in all_tokens if t in subject_lower)
-        return matches >= len(all_tokens) / 2
+    def _matches_relaxed(p: Product) -> bool:
+        return fuzz.token_sort_ratio(query, p.subject) > 60
 
     filtered = []
     for p in products:
@@ -286,20 +283,20 @@ def filter_results(products: list[Product], query: str) -> list[Product]:
             continue
         if _cjk_ratio(p.subject) > 0.4 and p.qc_image_count < 50:
             continue
-        if required and _matches_strict(p.subject.lower()):
+        if _matches_strict(p):
             filtered.append(p)
 
     if len(filtered) >= 3:
         return filtered
 
-    # Relax to half-token match
+    # Relax to lower threshold
     filtered_relaxed = []
     for p in products:
         if p.qc_image_count == 0:
             continue
         if _cjk_ratio(p.subject) > 0.4 and p.qc_image_count < 50:
             continue
-        if _matches_relaxed(p.subject.lower()):
+        if _matches_relaxed(p):
             filtered_relaxed.append(p)
 
     return filtered_relaxed if len(filtered_relaxed) >= 3 else products

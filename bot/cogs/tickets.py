@@ -79,6 +79,12 @@ def _build_results_embed(
             inline=False,
         )
 
+    # Set image to top premium product's major_img if available
+    if tiers_found["premium"]:
+        top_premium = tiers_found["premium"][0]
+        if top_premium.major_img:
+            embed.set_image(url=top_premium.major_img)
+
     total = len(products)
     if not agent:
         embed.set_footer(text=f"Select an agent below to get buy links · {total} results found")
@@ -243,6 +249,7 @@ class TicketsCog(commands.Cog):
                     "source_link": p.source_link,
                     "price_usd": p.price_usd,
                     "qc_image_count": p.qc_image_count,
+                    "major_img": p.major_img,
                 }
                 for p in products
             ]

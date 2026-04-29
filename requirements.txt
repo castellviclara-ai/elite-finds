@@ -3,3 +3,6 @@ aiohttp>=3.9.0
 supabase>=2.3.0
 ddddocr>=1.5.0
 python-dotenv>=1.0.0
+fuzzywuzzy>=0.18.0
+python-levenshtein>=0.12.0
+search1688api>=2.0.0
