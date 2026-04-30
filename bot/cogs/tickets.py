@@ -28,9 +28,10 @@ from bot.agents import build_agent_url
 from bot import db
 from bot.services.lovegobuy import Product
 from bot.services.image_search import (
-    fetch_reference_image,
-    search_by_image,
     bucket_by_price,
+    filter_by_relevance,
+    search_by_image,
+    search_with_query,
 )
 
 if TYPE_CHECKING:
@@ -39,7 +40,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 MAX_SUBJECT_LEN = 60
-MAX_RESULTS_EMBED = 25
+RESULTS_PER_PAGE = 20  # Discord allows 25 fields and 6000 chars total per embed
 SEARCH_TIMEOUT_SECS = 35   # full pipeline (download + 1688 + weidian)
 
 
@@ -116,17 +117,36 @@ def _build_results_embed(
     return embed
 
 
-def _build_all_results_embed(
+def _sort_by_price(products: list[Product]) -> list[Product]:
+    """Sort cheap → expensive, putting unknown-price (==0) at the end."""
+    return sorted(
+        products,
+        key=lambda p: (p.price_usd <= 0, p.price_usd, p.title or ""),
+    )
+
+
+def _build_page_embed(
     query: str,
-    products: list[Product],
+    products_sorted: list[Product],
     agent: Optional[str],
+    page: int,
+    total_pages: int,
 ) -> discord.Embed:
-    """Embed with up to 25 products, one field each."""
+    """One page of the paginated 'Show all' embed (sorted by price asc)."""
+    start = page * RESULTS_PER_PAGE
+    end = start + RESULTS_PER_PAGE
+    page_products = products_sorted[start:end]
+
     embed = discord.Embed(
         title=f"📋 All results for: {query}",
+        description=(
+            f"Sorted by price (cheap → expensive) · "
+            f"Page {page + 1}/{total_pages} · "
+            f"{len(products_sorted)} total"
+        ),
         color=0x000000,
     )
-    for i, p in enumerate(products[:MAX_RESULTS_EMBED], 1):
+    for i, p in enumerate(page_products, start + 1):
         emoji = TIER_EMOJI.get(p.tier, "")
         embed.add_field(
             name=f"{i}. {emoji} {p.price_display or f'${p.price_usd:.2f}'}",
@@ -211,6 +231,55 @@ class AgentSelectView(discord.ui.View):
 # Show all results button
 # ---------------------------------------------------------------------------
 
+class ResultsPaginator(discord.ui.View):
+    """Ephemeral view with Prev/Next buttons over price-sorted results."""
+
+    def __init__(
+        self,
+        query: str,
+        products: list[Product],
+        agent: Optional[str],
+    ):
+        super().__init__(timeout=600)
+        self.query = query
+        self.agent = agent
+        self.sorted_products = _sort_by_price(products)
+        self.total_pages = max(
+            1,
+            (len(self.sorted_products) + RESULTS_PER_PAGE - 1) // RESULTS_PER_PAGE,
+        )
+        self.page = 0
+        self._refresh_button_state()
+
+    def _refresh_button_state(self) -> None:
+        self.prev_btn.disabled = self.page <= 0
+        self.next_btn.disabled = self.page >= self.total_pages - 1
+        self.page_indicator.label = f"Page {self.page + 1}/{self.total_pages}"
+
+    def build_embed(self) -> discord.Embed:
+        return _build_page_embed(
+            self.query, self.sorted_products, self.agent,
+            self.page, self.total_pages,
+        )
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        self.page = max(0, self.page - 1)
+        self._refresh_button_state()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Page 1/1", style=discord.ButtonStyle.primary, disabled=True)
+    async def page_indicator(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        # Disabled label-only button; never invoked but Discord requires the callback.
+        await interaction.response.defer()
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def next_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        self.page = min(self.total_pages - 1, self.page + 1)
+        self._refresh_button_state()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+
 class ShowAllView(discord.ui.View):
     def __init__(self, query: str, products: list[Product], agent: Optional[str]):
         super().__init__(timeout=300)
@@ -226,8 +295,12 @@ class ShowAllView(discord.ui.View):
         self.add_item(btn)
 
     async def _show_all_callback(self, interaction: discord.Interaction) -> None:
-        embed = _build_all_results_embed(self.query, self.products, self.agent)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        paginator = ResultsPaginator(self.query, self.products, self.agent)
+        await interaction.response.send_message(
+            embed=paginator.build_embed(),
+            view=paginator,
+            ephemeral=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -279,12 +352,13 @@ class TicketsCog(commands.Cog):
             pass
 
         # ------------------------------------------------------------------
-        # 1. Get reference image bytes
+        # 1. Resolve to products (image attachment OR text query)
         # ------------------------------------------------------------------
-        image_bytes: Optional[bytes] = None
         photo_source_url: Optional[str] = None
+        products: list[Product] = []
 
         if image is not None:
+            # ── Attached image path ──────────────────────────────────────
             if not image.content_type or not image.content_type.startswith("image/"):
                 await interaction.followup.send(
                     "That attachment doesn't look like an image. Please attach a JPG/PNG/WebP."
@@ -302,34 +376,47 @@ class TicketsCog(commands.Cog):
                 log.warning("Failed to read attachment: %s", e)
                 await interaction.followup.send("Couldn't read the attached image. Try again.")
                 return
+
+            try:
+                products = await asyncio.wait_for(
+                    search_by_image(image_bytes), timeout=SEARCH_TIMEOUT_SECS
+                )
+            except asyncio.TimeoutError:
+                await interaction.followup.send(
+                    "⏱️ Search took too long. Please try again in a moment."
+                )
+                return
+            except Exception as e:
+                log.error("search_by_image error: %s", e)
+                await interaction.followup.send(
+                    "⚠️ Search failed due to an internal error. Please try again."
+                )
+                return
         else:
-            # Text query → fetch reference photo from DuckDuckGo
-            image_bytes, photo_source_url = await fetch_reference_image(expanded)
-            if not image_bytes:
+            # ── Text query path: try multiple Bing candidates ────────────
+            try:
+                products, photo_source_url = await asyncio.wait_for(
+                    search_with_query(expanded, max_candidates=4),
+                    timeout=SEARCH_TIMEOUT_SECS,
+                )
+            except asyncio.TimeoutError:
+                await interaction.followup.send(
+                    "⏱️ Search took too long. Please try again in a moment."
+                )
+                return
+            except Exception as e:
+                log.error("search_with_query error: %s", e)
+                await interaction.followup.send(
+                    "⚠️ Search failed due to an internal error. Please try again."
+                )
+                return
+
+            if not photo_source_url:
                 await interaction.followup.send(
                     f"Couldn't find a reference photo for **{expanded}**.\n"
                     "Try a more specific query or attach an image directly."
                 )
                 return
-
-        # ------------------------------------------------------------------
-        # 2. Run image search (1688 + Weidian in parallel) with hard timeout
-        # ------------------------------------------------------------------
-        try:
-            products = await asyncio.wait_for(
-                search_by_image(image_bytes), timeout=SEARCH_TIMEOUT_SECS
-            )
-        except asyncio.TimeoutError:
-            await interaction.followup.send(
-                "⏱️ Search took too long. Please try again in a moment."
-            )
-            return
-        except Exception as e:
-            log.error("search_by_image error: %s", e)
-            await interaction.followup.send(
-                "⚠️ Search failed due to an internal error. Please try again."
-            )
-            return
 
         if not products:
             await interaction.followup.send(
@@ -337,6 +424,12 @@ class TicketsCog(commands.Cog):
                 "Try attaching a clearer photo, or use a more specific query."
             )
             return
+
+        # ------------------------------------------------------------------
+        # 2. Drop obviously off-topic results (title doesn't match query)
+        # ------------------------------------------------------------------
+        if query:
+            products = filter_by_relevance(products, query)
 
         # ------------------------------------------------------------------
         # 3. Bucket by price tier and render

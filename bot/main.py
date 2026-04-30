@@ -2,17 +2,15 @@
 Elite Finds Bot — entry point.
 
 Startup sequence:
-  1. Start keep-alive HTTP server (required for Replit hosting)
-  2. Pre-login to uufinds (caches JWT so first /find is fast)
-  3. Load cogs
-  4. Sync slash commands globally
-  5. Set status
+  1. Pre-login to uufinds (caches JWT so first /find is fast)
+  2. Load cogs
+  3. Sync slash commands globally
+  4. Set status
 """
 
 import asyncio
 import logging
 import os
-from aiohttp import web
 
 import discord
 from discord.ext import commands
@@ -32,21 +30,6 @@ COGS = [
     "bot.cogs.tickets",
     "bot.cogs.link_converter",
 ]
-
-
-async def _keep_alive() -> None:
-    """Minimal HTTP server so Replit doesn't kill the process."""
-    async def handle(request: web.Request) -> web.Response:
-        return web.Response(text="Elite Finds is running.")
-
-    app = web.Application()
-    app.router.add_get("/", handle)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    log.info("Keep-alive server listening on port %d", port)
 
 
 class EliteFindsBot(commands.Bot):
@@ -97,7 +80,6 @@ class EliteFindsBot(commands.Bot):
 
 
 async def main() -> None:
-    await _keep_alive()
     token = os.environ["DISCORD_TOKEN"]
     bot = EliteFindsBot()
     async with bot:
