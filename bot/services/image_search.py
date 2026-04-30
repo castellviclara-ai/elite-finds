@@ -83,6 +83,16 @@ _KEYWORD_ALIASES: dict[str, list[str]] = {
     "reebok": ["锐步"],
     "hoka": ["霍卡"],
     "salomon": ["萨洛蒙"],
+    "under armour": ["安德玛", "安德码", "ua"],
+    "ua": ["under armour", "安德玛"],
+    "lululemon": ["露露乐蒙", "lulu", "露露"],
+    "on running": ["昂跑", "on cloud"],
+    "crocs": ["卡骆驰", "洞洞鞋"],
+    "birkenstock": ["勃肯", "博肯"],
+    "ugg": ["雪地靴"],
+    "timberland": ["添柏岚", "大黄靴"],
+    "dr martens": ["马丁", "马丁靴", "doc martens"],
+    "doc martens": ["dr martens", "马丁"],
     # Sneaker models
     "air force": ["空军", "af"],
     "air force 1": ["空军", "af1", "af 1", "空军一号"],
@@ -399,20 +409,131 @@ async def _try_candidate(image_bytes: bytes) -> list[Product]:
     return _dedupe(products)
 
 
+# English → Chinese category translations used to build CJK query variants.
+# When the user types e.g. "under armour tshirt" we ALSO search Bing for
+# "安德玛 t恤" to get images that are indexed by 1688/Weidian.
+_CATEGORY_CN: dict[str, str] = {
+    "tshirt": "t恤",
+    "t-shirt": "t恤",
+    "tee": "t恤",
+    "shirt": "衬衫",
+    "polo": "polo衫",
+    "hoodie": "卫衣",
+    "sweatshirt": "卫衣",
+    "sweater": "毛衣",
+    "jacket": "夹克",
+    "coat": "外套",
+    "puffer": "羽绒服",
+    "vest": "马甲",
+    "shorts": "短裤",
+    "pants": "长裤",
+    "trousers": "长裤",
+    "jeans": "牛仔裤",
+    "joggers": "运动裤",
+    "tracksuit": "运动套装",
+    "sneakers": "运动鞋",
+    "shoes": "鞋",
+    "boots": "靴子",
+    "slides": "拖鞋",
+    "sandals": "凉鞋",
+    "cap": "帽子",
+    "hat": "帽子",
+    "beanie": "毛线帽",
+    "bag": "包",
+    "backpack": "背包",
+    "wallet": "钱包",
+    "belt": "腰带",
+    "scarf": "围巾",
+    "socks": "袜子",
+    "ring": "戒指",
+    "necklace": "项链",
+    "bracelet": "手链",
+    "watch": "手表",
+    "sunglasses": "太阳镜",
+}
+
+
+def _build_query_variants(query: str) -> list[str]:
+    """
+    Return up to 3 Bing search query variants for better image discovery.
+
+    Strategy:
+      1. Always include the original query (English).
+      2. If a known brand has a CJK alias AND we recognize the category,
+         build a fully-Chinese variant ("安德玛 t恤"). This finds images
+         indexed by Chinese marketplaces, not Western retailers.
+      3. If only a brand alias (no recognized category), build "<CN-brand>
+         <original-category-word>" as a softer fallback.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    out: list[str] = [q]
+    qlow = q.lower()
+
+    # Find the longest matching brand keyword that has a CJK alias.
+    brand_kw: str | None = None
+    brand_cn: str | None = None
+    for kw, aliases in _KEYWORD_ALIASES.items():
+        if kw not in qlow:
+            continue
+        cjk = next((a for a in aliases if any("\u4e00" <= c <= "\u9fff" for c in a)), None)
+        if cjk and (brand_kw is None or len(kw) > len(brand_kw)):
+            brand_kw = kw
+            brand_cn = cjk
+    if not brand_cn:
+        return out
+
+    # Find a category word in the remaining tokens.
+    rest = qlow.replace(brand_kw or "", " ")
+    cat_cn: str | None = None
+    cat_en: str | None = None
+    for word in re.split(r"[\s\-_/,.]+", rest):
+        if word in _CATEGORY_CN:
+            cat_cn = _CATEGORY_CN[word]
+            cat_en = word
+            break
+
+    if cat_cn:
+        out.append(f"{brand_cn} {cat_cn}")
+    else:
+        # Use the brand alias alone — Bing in CN will return marketplace-style imagery
+        out.append(brand_cn)
+    return out
+
+
 async def search_with_query(
     query: str,
     max_candidates: int = 4,
 ) -> tuple[list[Product], str | None]:
     """
     Resolve a text query into products by trying multiple Bing image
-    candidates. Returns (products, source_image_url).
+    candidates across query variants (English original + Chinese variant
+    when a brand alias is known). Returns (products, source_image_url).
 
     Stops at the first candidate where BOTH marketplaces return at least
     one result. Otherwise picks the candidate with the most total results.
     """
-    candidates = await get_image_candidates(query, max_results=max_candidates)
+    variants = _build_query_variants(query)
+    log.info("Query variants for %r: %s", query, variants)
+
+    # Pull candidates from each variant, interleave to try diverse images first
+    per_variant: list[list[str]] = []
+    for v in variants:
+        cands = await get_image_candidates(v, max_results=max_candidates)
+        if cands:
+            per_variant.append(cands)
+    candidates: list[str] = []
+    seen: set[str] = set()
+    if per_variant:
+        for i in range(max(len(c) for c in per_variant)):
+            for cl in per_variant:
+                if i < len(cl) and cl[i] not in seen:
+                    seen.add(cl[i])
+                    candidates.append(cl[i])
+
     if not candidates:
-        log.info("No image candidates for query=%r", query)
+        log.info("No image candidates for query=%r (variants=%s)", query, variants)
         return [], None
 
     best: tuple[int, list[Product], str] | None = None
